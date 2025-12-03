@@ -277,6 +277,104 @@ class FreqFuse3D(nn.Module):
         return fused
 
 
+class ALPF3D(nn.Module):
+    """
+    自适应低通滤波块（3D）- 深度可分离卷积 + 门控
+
+    结构:
+        Depthwise Conv3d(3x3x3, groups=C) -> Pointwise Conv3d(1x1x1)
+        -> Norm -> Sigmoid 门控
+        输出: gate * low_pass + (1 - gate) * x
+    """
+    def __init__(self, channels, normalization='instancenorm'):
+        super().__init__()
+        self.dw = nn.Conv3d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False)
+        self.pw = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
+        self.norm = norm3d(normalization, channels)
+        self.gate = nn.Sequential(
+            nn.Conv3d(channels, channels, kernel_size=1, bias=True),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        low_pass = self.norm(self.pw(self.dw(x)))
+        gate = self.gate(x)
+        return low_pass * gate + x * (1 - gate)
+
+
+class AHPF3D(nn.Module):
+    """
+    自适应高通增强块（3D）- 深度可分离卷积 + 门控
+
+    结构:
+        Depthwise Conv3d -> Pointwise Conv3d -> Norm
+        预测门控后强调高频残差: x + gate * (x - filtered)
+    """
+    def __init__(self, channels, normalization='instancenorm'):
+        super().__init__()
+        self.dw = nn.Conv3d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False)
+        self.pw = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
+        self.norm = norm3d(normalization, channels)
+        self.gate = nn.Sequential(
+            nn.Conv3d(channels, channels, kernel_size=1, bias=True),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        filtered = self.norm(self.pw(self.dw(x)))
+        gate = self.gate(x)
+        return x + gate * (x - filtered)
+
+
+class Offset3D(nn.Module):
+    """
+    3D 偏移对齐模块 - 基于 grid_sample 的可学习偏移预测
+
+    输入:
+        ref: [B, C, D, H, W] 参考特征（通常为低频）
+        feat: [B, C, D, H, W] 需要对齐的特征
+    输出:
+        aligned_feat: [B, C, D, H, W]
+    """
+    def __init__(self, channels, normalization='instancenorm'):
+        super().__init__()
+        in_ch = channels * 2
+        self.dw = nn.Conv3d(in_ch, in_ch, kernel_size=3, padding=1, groups=in_ch, bias=False)
+        self.pw = nn.Conv3d(in_ch, channels, kernel_size=1, bias=False)
+        self.norm = norm3d(normalization, channels)
+        self.gate = nn.Sequential(
+            nn.Conv3d(in_ch, channels, kernel_size=1, bias=True),
+            nn.Sigmoid()
+        )
+        self.offset = nn.Conv3d(channels, 3, kernel_size=1, bias=True)
+
+    def forward(self, ref, feat):
+        # 深度可分离提取偏移特征
+        x = torch.cat([ref, feat], dim=1)
+        feat_dw = self.dw(x)
+        feat_pw = self.norm(self.pw(feat_dw))
+        gated = feat_pw * self.gate(x)
+
+        offset = torch.tanh(self.offset(gated))  # [B, 3, D, H, W]
+
+        B, _, D, H, W = offset.shape
+        device = offset.device
+        dtype = offset.dtype
+
+        # 构建归一化坐标网格
+        zs = torch.linspace(-1.0, 1.0, steps=D, device=device, dtype=dtype)
+        ys = torch.linspace(-1.0, 1.0, steps=H, device=device, dtype=dtype)
+        xs = torch.linspace(-1.0, 1.0, steps=W, device=device, dtype=dtype)
+        base_grid = torch.stack(torch.meshgrid(zs, ys, xs, indexing='ij'), dim=-1)  # [D, H, W, 3]
+        base_grid = base_grid.unsqueeze(0).expand(B, -1, -1, -1, -1)  # [B, D, H, W, 3]
+
+        offset_grid = offset.permute(0, 2, 3, 4, 1)  # [B, D, H, W, 3]
+        sampling_grid = base_grid + offset_grid
+
+        aligned = F.grid_sample(feat, sampling_grid, mode='bilinear', padding_mode='border', align_corners=True)
+        return aligned
+
+
 # blocks.py 里的一个实现示例
 class MultiScaleLocal3D(nn.Module):
     """
@@ -449,7 +547,84 @@ class Dilated_Freq_Fuse3D(nn.Module):
 
         # 7) 残差细化
         fused = self.refine(fused)                          # [B, C, D, H, W]
-        
+
+        return fused
+
+
+class LH_Filter_Fuse(nn.Module):
+    """
+    低高频滤波融合模块
+
+    工作流程:
+        (a) 可选对 LLL 低频进行 ALPF3D 低通滤波
+        (b) 对 7 个高频子带做 band-wise 注意力
+        (c) 使用 1x1x1 Conv 聚合高频
+        (d) 可选通过 AHPF3D 增强高频
+        (e) 可选通过 Offset3D 与低频对齐
+        (f) SE 风格通道注意力融合
+        (g) ResidualFuse3D 精炼
+    """
+    def __init__(self, channels, normalization='instancenorm', reduction=4,
+                 use_alpf=True, use_ahpf=True, use_offset=True):
+        super().__init__()
+        self.use_alpf = use_alpf
+        self.use_ahpf = use_ahpf
+        self.use_offset = use_offset
+
+        self.low_filter = ALPF3D(channels, normalization) if use_alpf else nn.Identity()
+        self.high_enhance = AHPF3D(channels, normalization) if use_ahpf else nn.Identity()
+        self.offset_align = Offset3D(channels, normalization) if use_offset else nn.Identity()
+
+        self.high_agg_conv = nn.Conv3d(channels * 7, channels, kernel_size=1, bias=False)
+
+        hidden = max(7 * 2, 8)
+        self.band_mlp = nn.Sequential(
+            nn.Linear(7, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, 7),
+            nn.Sigmoid()
+        )
+
+        mid_ch = max(channels // reduction, 8)
+        self.channel_att = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1),
+            nn.Conv3d(channels, mid_ch, 1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(mid_ch, channels, 1, bias=True),
+            nn.Sigmoid()
+        )
+
+        self.refine = ResidualFuse3D(channels, channels, normalization=normalization)
+
+    def forward(self, low, highs):
+        """
+        low:   [B, C, D, H, W]
+        highs: [B, C, 7, D, H, W]
+        返回: [B, C, D, H, W]
+        """
+        B, C, S, D, H, W = highs.shape
+        assert S == 7, f"Expect 7 high-frequency subbands, got {S}"
+
+        low_proc = self.low_filter(low)
+
+        band_desc = highs.mean(dim=(3, 4, 5)).mean(dim=1)  # [B, 7]
+        band_weights = self.band_mlp(band_desc).view(B, 1, S, 1, 1, 1)
+        highs_weighted = highs * band_weights
+
+        highs_reshaped = highs_weighted.view(B, C * S, D, H, W)
+        high_agg = self.high_agg_conv(highs_reshaped)
+
+        high_agg = self.high_enhance(high_agg)
+
+        if self.use_offset:
+            aligned_high = self.offset_align(low_proc, high_agg)
+        else:
+            aligned_high = high_agg
+
+        base = low_proc + aligned_high
+        ch_att = self.channel_att(base)
+        fused = base * ch_att
+        fused = self.refine(fused)
         return fused
 
 # ========== 导出接口 ==========
@@ -460,4 +635,8 @@ __all__ = [
     'FreqFuse3D',
     'Dilated_Freq_Fuse3D',
     'MultiScaleLocal3D',
+    'ALPF3D',
+    'AHPF3D',
+    'Offset3D',
+    'LH_Filter_Fuse',
 ]
