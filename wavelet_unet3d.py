@@ -1,12 +1,12 @@
 """
 3D UNet with wavelet-based cross-scale attention for abdominal multi-organ CT segmentation.
 
-The network is tailored for 13 abdominal organs (excluding background) and operates on
-96x96x96 input patches. The output is raw logits with 13 channels.
+The network is tailored for abdominal CT patches (default 96x96x96). It outputs raw logits
+with ``num_classes`` channels (default 13 organs, excluding background).
 """
 
 import math
-from typing import Tuple
+from typing import Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -218,14 +218,39 @@ class DecoderBlock(nn.Module):
 
 
 class WaveletUNet3D(nn.Module):
-    """Wavelet-augmented 3D UNet for 13-organ abdominal CT segmentation."""
+    """Wavelet-augmented 3D UNet for abdominal CT segmentation."""
 
-    def __init__(self):
+    def __init__(self, in_channels: int = 1, num_classes: int = 13, patch_size: Sequence[int] = (96, 96, 96)):
         super().__init__()
+
+        if isinstance(patch_size, int):
+            patch_size = (patch_size, patch_size, patch_size)
+        if len(patch_size) != 3:
+            raise ValueError("patch_size must be an int or a sequence of three ints")
+
+        self.patch_size = tuple(patch_size)
+
+        def _down_dims(factor: int) -> Tuple[int, int, int]:
+            if any(dim % factor != 0 for dim in self.patch_size):
+                raise ValueError(f"patch_size dimensions must be divisible by {factor} for encoder down-sampling")
+            return tuple(dim // factor for dim in self.patch_size)
+
+        def _token_patch(dims: Tuple[int, int, int]) -> Tuple[int, int, int]:
+            if any(d % 6 != 0 for d in dims):
+                raise ValueError("Each dimension of feature maps must be divisible by 6 for tokenization")
+            return tuple(d // 6 for d in dims)
+
+        attn1_img = _down_dims(2)
+        attn2_img = _down_dims(4)
+        attn3_img = _down_dims(8)
+
+        attn1_patch = _token_patch(attn1_img)
+        attn2_patch = _token_patch(attn2_img)
+        attn3_patch = _token_patch(attn3_img)
 
         self.dwt = DWT3D()
 
-        self.e1 = EncoderBlock(1, 32)
+        self.e1 = EncoderBlock(in_channels, 32)
         self.e2 = EncoderBlock(32, 64)
         self.e3 = EncoderBlock(64, 128)
         self.e4 = EncoderBlock(128, 256)
@@ -233,22 +258,22 @@ class WaveletUNet3D(nn.Module):
         self.attention1 = TransformerBlock(
             skip_channels=64,
             num_heads=4,
-            patch_size=(8, 8, 8),
-            img_size=(48, 48, 48),
+            patch_size=attn1_patch,
+            img_size=attn1_img,
             hf_channels=7,
         )
         self.attention2 = TransformerBlock(
             skip_channels=128,
             num_heads=4,
-            patch_size=(4, 4, 4),
-            img_size=(24, 24, 24),
+            patch_size=attn2_patch,
+            img_size=attn2_img,
             hf_channels=7,
         )
         self.attention3 = TransformerBlock(
             skip_channels=256,
             num_heads=4,
-            patch_size=(2, 2, 2),
-            img_size=(12, 12, 12),
+            patch_size=attn3_patch,
+            img_size=attn3_img,
             hf_channels=7,
         )
 
@@ -259,7 +284,7 @@ class WaveletUNet3D(nn.Module):
         self.d3 = DecoderBlock((128, 80, 64), 64)
         self.d4 = DecoderBlock((64, 32, 32), 32)
 
-        self.output = nn.Conv3d(32, 13, kernel_size=1, padding=0)
+        self.output = nn.Conv3d(32, num_classes, kernel_size=1, padding=0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         l1, h1 = self.dwt(x)
@@ -287,3 +312,29 @@ class WaveletUNet3D(nn.Module):
 
         out = self.output(d4)
         return out
+
+
+def create_model(n_classes: int = 14, patchsize: int = 96, ema: bool = False) -> nn.Module:
+    """
+    Training entry-point to build the wavelet UNet.
+
+    Args:
+        n_classes: Number of segmentation classes (including background if applicable).
+        patchsize: Cubic patch edge length (e.g., 96).
+        ema: If True, detach parameters for EMA initialization.
+
+    Returns:
+        Torch model placed on CUDA, optionally wrapped with ``DataParallel``.
+    """
+
+    patch = (patchsize, patchsize, patchsize)
+    net = WaveletUNet3D(in_channels=1, num_classes=n_classes, patch_size=patch)
+
+    if torch.cuda.device_count() > 1:
+        net = nn.DataParallel(net)
+
+    model = net.cuda()
+    if ema:
+        for p in model.parameters():
+            p.detach_()
+    return model
